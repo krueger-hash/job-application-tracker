@@ -1,0 +1,27 @@
+name: Verify AWS OIDC
+
+# A throwaway connectivity test. Run it by hand from the Actions tab.
+# If it prints an assumed-role identity in the right account, your OIDC
+# trust is correct and you can delete this file.
+on:
+  workflow_dispatch:
+
+# Required so GitHub will mint the OIDC token used to assume the role.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  verify-staging:
+    runs-on: ubuntu-latest
+    environment: staging        # MUST match the trust policy's environment claim
+    steps:
+      - name: Assume the deploy role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Confirm who we are
+        run: aws sts get-caller-identity
+        # Expect: Account = 488347380584, Arn = .../GitHubActionsDeploymentRole/...
