@@ -65,12 +65,20 @@ Resources:
             Fn::ImportValue: !Sub '${BaseStackName}-DbEndpointAddress'
           DB_NAME:
             Fn::ImportValue: !Sub '${BaseStackName}-DbName'
-          DB_PORT: '5432'
+          DB_PORT:
+            Fn::ImportValue: !Sub '${BaseStackName}-DbEndpointPort'
 
       Policies:
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn:
-              Fn::ImportValue: !Sub '${BaseStackName}-DbSecretArn'
+        # Inline statement instead of the AWSSecretsManagerGetSecretValuePolicy
+        # managed template: the template expands to an Fn::Sub with an inline
+        # variable binding that LocalStack's SAM transform mishandles
+        # ("Unresolved resource dependencies [secretArn]"). This form is
+        # equivalent and deploys identically on real AWS and LocalStack.
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource:
+                Fn::ImportValue: !Sub '${BaseStackName}-DbSecretArn'
 
       Events:
         ApiProxy:

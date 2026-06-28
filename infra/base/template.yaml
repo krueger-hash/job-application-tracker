@@ -27,6 +27,21 @@ Parameters:
     Default: db.t4g.micro      # Free-tier eligible (750 hrs/month for 12 months).
     Description: RDS instance size.
 
+  UseLocalStack:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: >
+      Set to 'true' when deploying to LocalStack. LocalStack's RDS does not
+      implement ManageMasterUserPassword / MasterUserSecret, so we create the
+      credentials secret ourselves and feed the password into RDS. On real AWS
+      this stays 'false' and RDS manages the secret natively.
+
+Conditions:
+  # When true, this stack creates its own Secrets Manager secret instead of
+  # relying on RDS-managed credentials (which LocalStack can't produce).
+  SelfManagedSecret: !Equals [!Ref UseLocalStack, 'true']
+
 Resources:
   # ---------------------------------------------------------------------------
   # Network: a VPC with two PRIVATE subnets (RDS needs >=2 AZs). No internet
@@ -155,6 +170,21 @@ Resources:
       DBSubnetGroupDescription: Private subnets for RDS.
       SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
 
+  # LocalStack-only: a self-managed credentials secret with the SAME JSON shape
+  # RDS produces for ManageMasterUserPassword ({ "username", "password" }), so
+  # Spring's aws-secretsmanager config import works unchanged. Not created on
+  # real AWS (Condition), where RDS manages its own secret.
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: SelfManagedSecret
+    Properties:
+      Name: !Sub '${Environment}-job-tracker-db-credentials'
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${MasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true   # keep it simple for a JDBC URL / RDS password rules
+
   Database:
     Type: AWS::RDS::DBInstance
     # DELETE removes the DB (and its data) when the stack is torn down — handy
@@ -172,7 +202,15 @@ Resources:
       StorageEncrypted: true
       DBName: !Ref DBName
       MasterUsername: !Ref MasterUsername
-      ManageMasterUserPassword: true  # RDS generates the password + a Secrets Manager secret
+      # Real AWS: let RDS generate + manage the password in Secrets Manager.
+      # LocalStack: feed the password from our self-managed DbSecret instead
+      # (ManageMasterUserPassword is unsupported there). The two properties are
+      # mutually exclusive, so each path supplies exactly one via AWS::NoValue.
+      ManageMasterUserPassword: !If [SelfManagedSecret, !Ref 'AWS::NoValue', true]
+      MasterUserPassword: !If
+        - SelfManagedSecret
+        - !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+        - !Ref 'AWS::NoValue'
       MultiAZ: false
       PubliclyAccessible: false
       BackupRetentionPeriod: 7
@@ -203,13 +241,23 @@ Outputs:
     Export: { Name: !Sub '${AWS::StackName}-LambdaSecurityGroupId' }
 
   DbSecretArn:
-    Description: ARN of the RDS-managed credentials secret.
-    Value: !GetAtt Database.MasterUserSecret.SecretArn
+    Description: ARN of the DB credentials secret (RDS-managed on AWS, self-managed on LocalStack).
+    Value: !If
+      - SelfManagedSecret
+      - !Ref DbSecret
+      - !GetAtt Database.MasterUserSecret.SecretArn
     Export: { Name: !Sub '${AWS::StackName}-DbSecretArn' }
 
   DbEndpointAddress:
     Value: !GetAtt Database.Endpoint.Address
     Export: { Name: !Sub '${AWS::StackName}-DbEndpointAddress' }
+
+  DbEndpointPort:
+    # On real AWS this is 5432; on LocalStack RDS is exposed on a dynamically
+    # assigned port (4510-4559 range), so the app stack must import this rather
+    # than hardcode 5432.
+    Value: !GetAtt Database.Endpoint.Port
+    Export: { Name: !Sub '${AWS::StackName}-DbEndpointPort' }
 
   DbName:
     Value: !Ref DBName
