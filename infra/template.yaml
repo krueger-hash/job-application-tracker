@@ -1,0 +1,85 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Application stack for job-application-tracker: the Spring Boot Java Lambda
+  (via aws-serverless-java-container) behind an HTTP API, attached to the VPC
+  so it can reach RDS. Imports VPC + DB values from the base stack.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [staging, production]
+
+  BaseStackName:
+    Type: String
+    Description: Name of the base stack to import VPC/DB exports from.
+
+  MainClass:
+    Type: String
+    # >>> SET THIS to your @SpringBootApplication class's fully-qualified name,
+    Default: org.job.application.tracker.backend.BackendApplication
+    Description: FQN of your @SpringBootApplication class (MAIN_CLASS).
+
+Globals:
+  Function:
+    Runtime: java21
+    MemorySize: 1024            # Java/Spring likes headroom; raise to 1536/2048 if cold starts hurt.
+    Timeout: 30
+    Architectures: [x86_64]     # SnapStart's most broadly-supported arch - keep x86_64.
+    Tracing: Active
+
+Resources:
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-job-tracker-api'
+      CodeUri: ../backend                # backend/ - the dir containing pom.xml; sam build runs Maven here.
+      # The generic Spring Boot adapter handler. It boots your app via MAIN_CLASS.
+      Handler: com.amazonaws.serverless.proxy.spring.SpringDelegatingLambdaContainerHandler
+
+      # SnapStart - the Java cold-start fix. Needs a published version, which
+      # AutoPublishAlias provides.
+      AutoPublishAlias: live
+      SnapStart:
+        ApplyOn: PublishedVersions # TODO: Snapstart needs additional logic to work with spring boot correctly - PublishedVersions
+
+      # Attach to the VPC so the Lambda can reach RDS privately.
+      VpcConfig:
+        SubnetIds:
+          - Fn::ImportValue: !Sub '${BaseStackName}-PrivateSubnet1Id'
+          - Fn::ImportValue: !Sub '${BaseStackName}-PrivateSubnet2Id'
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${BaseStackName}-LambdaSecurityGroupId'
+
+      Environment:
+        Variables:
+          MAIN_CLASS: !Ref MainClass
+          SPRING_PROFILES_ACTIVE: !Ref Environment
+          # DB wiring. The RDS-managed secret holds only username + password,
+          # so the host/port/name are passed separately. Your Spring datasource
+          # config reads the secret for credentials and builds the JDBC URL from
+          # DB_HOST / DB_PORT / DB_NAME.
+          DB_SECRET_ARN:
+            Fn::ImportValue: !Sub '${BaseStackName}-DbSecretArn'
+          DB_HOST:
+            Fn::ImportValue: !Sub '${BaseStackName}-DbEndpointAddress'
+          DB_NAME:
+            Fn::ImportValue: !Sub '${BaseStackName}-DbName'
+          DB_PORT: '5432'
+
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn:
+              Fn::ImportValue: !Sub '${BaseStackName}-DbSecretArn'
+
+      Events:
+        ApiProxy:
+          Type: HttpApi
+          Properties:
+            Path: /{proxy+}
+            Method: ANY
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the HTTP API (feed this to the React app later).
+    Value: !Sub 'https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
