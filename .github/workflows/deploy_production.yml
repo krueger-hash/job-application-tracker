@@ -1,0 +1,79 @@
+name: Release to prod
+
+# Triggered by pushing a version tag (e.g. v0.1.0). It promotes the artifact
+# for the tagged commit - which must already have been built & staged by
+# publish-main (i.e. the tag points at a commit already on main). No rebuild:
+# prod runs the exact same artifact that was validated in staging.
+#
+# Also keeps a manual trigger as an escape hatch / rollback path: dispatch with
+# a specific SHA to promote an older build.
+on:
+  push:
+    tags:
+      - 'v*'            # v0.1.0, v1.2.3, etc. Tighten to 'v*.*.*' for strict semver.
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit SHA to promote (blank = latest staged). For rollback."
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+  ARTIFACT_BUCKET: job-application-tracker-artifacts-488347380584   # staging bucket (read cross-account)
+  MAIN_CLASS: org.job.application.tracker.backend.BackendApplication
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: production   # OIDC trust scoped here + the approval gate (once repo is public)
+    steps:
+      - name: Assume prod deploy role (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve which SHA to promote
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Tag push: promote the commit the tag points at.
+            SHA="${GITHUB_SHA}"
+            echo "Tag ${GITHUB_REF_NAME} -> commit $SHA"
+          else
+            # Manual dispatch: explicit SHA, or fall back to latest staged.
+            SHA="${{ github.event.inputs.sha }}"
+            [ -z "$SHA" ] && SHA="$(aws s3 cp "s3://$ARTIFACT_BUCKET/staged/latest" -)"
+            echo "Manual promote -> commit $SHA"
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the artifact exists (must be built & staged first)
+        run: |
+          if ! aws s3 ls "s3://$ARTIFACT_BUCKET/builds/${{ steps.resolve.outputs.sha }}/packaged.yaml" >/dev/null 2>&1; then
+            echo "::error::No published artifact for ${{ steps.resolve.outputs.sha }}. Tag a commit that's on main and already built by publish-main."
+            exit 1
+          fi
+
+      - name: Fetch the immutable artifact template (cross-account)
+        run: |
+          aws s3 cp \
+            "s3://$ARTIFACT_BUCKET/builds/${{ steps.resolve.outputs.sha }}/packaged.yaml" \
+            packaged.yaml
+
+      - name: Deploy the same artifact to prod
+        run: |
+          aws cloudformation deploy \
+            --template-file packaged.yaml \
+            --stack-name job-application-tracker-app-production \
+            --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+            --region "$AWS_REGION" \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              Environment=production \
+              BaseStackName=job-application-tracker-base-production \
+              MainClass="$MAIN_CLASS"

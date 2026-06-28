@@ -1,0 +1,25 @@
+version = 0.1
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+# ---------- STAGING (account 488347380584) ----------
+[staging.deploy.parameters]
+stack_name = "job-application-tracker-app-staging"
+region = "eu-central-1"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+fail_on_empty_changeset = false
+parameter_overrides = "BaseStackName=\"job-application-tracker-base-staging\" Environment=\"staging\""
+
+# ---------- PRODUCTION (account 984454382060) ----------
+[production.deploy.parameters]
+stack_name = "job-application-tracker-app-production"
+region = "eu-central-1"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+fail_on_empty_changeset = false
+parameter_overrides = "BaseStackName=\"job-application-tracker-base-production\" Environment=\"production\""

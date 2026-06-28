@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Base infrastructure for job-application-tracker: a fully private VPC, RDS
+  PostgreSQL, and the VPC endpoints needed so a VPC-attached Lambda can reach
+  AWS services WITHOUT a NAT Gateway. Deploy once per environment. The app
+  (SAM) stack imports the exported values from here.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [staging, production]
+    Description: Used for naming and tagging.
+
+  DBName:
+    Type: String
+    Default: jobtracker
+    Description: Initial database name.
+
+  MasterUsername:
+    Type: String
+    Default: appadmin
+    Description: RDS master username (password is generated + stored in Secrets Manager).
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.micro      # Free-tier eligible (750 hrs/month for 12 months).
+    Description: RDS instance size.
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Network: a VPC with two PRIVATE subnets (RDS needs >=2 AZs). No internet
+  # gateway, no NAT — nothing in here talks to the public internet. The Lambda
+  # reaches AWS services through the VPC endpoints below instead.
+  # ---------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true       # required for interface-endpoint private DNS
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub '${Environment}-vpc' }
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${Environment}-private-1' }
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${Environment}-private-2' }
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${Environment}-private-rt' }
+
+  Subnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  Subnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------------------
+  # Security groups
+  # ---------------------------------------------------------------------------
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for the VPC-attached Lambda.
+      VpcId: !Ref Vpc
+      # A custom SG denies all egress by default, so we must allow it. The VPC
+      # has no internet route, so allow-all only actually reaches RDS + the
+      # endpoints. Tighten to specific ports/SGs later if you like.
+      SecurityGroupEgress:
+        - { IpProtocol: '-1', CidrIp: 0.0.0.0/0 }
+      Tags:
+        - { Key: Name, Value: !Sub '${Environment}-lambda-sg' }
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for RDS. Only the Lambda may connect on 5432.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub '${Environment}-rds-sg' }
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for interface endpoints. HTTPS from the Lambda only.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub '${Environment}-endpoint-sg' }
+
+  # ---------------------------------------------------------------------------
+  # VPC endpoints (the no-NAT magic)
+  # ---------------------------------------------------------------------------
+  # S3 gateway endpoint — FREE. Attaches to the route table.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  # Secrets Manager interface endpoint — so the Lambda can read DB creds at
+  # runtime. This is the one recurring cost in the no-NAT design (~$0.01/hr per
+  # AZ). Placed in ONE subnet to keep it cheap; add PrivateSubnet2 for HA.
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnet1]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  # ---------------------------------------------------------------------------
+  # Database
+  # ---------------------------------------------------------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for RDS.
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    # DELETE removes the DB (and its data) when the stack is torn down — handy
+    # for a learning project + clean teardown. Change to Snapshot/Retain once
+    # the data matters.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: postgres
+      # EngineVersion intentionally omitted → RDS uses its current default,
+      # which avoids "version not available" deploy failures. Pin it later.
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: '20'          # free-tier includes 20 GB
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: !Ref DBName
+      MasterUsername: !Ref MasterUsername
+      ManageMasterUserPassword: true  # RDS generates the password + a Secrets Manager secret
+      MultiAZ: false
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref RdsSecurityGroup]
+      Tags:
+        - { Key: Name, Value: !Sub '${Environment}-postgres' }
+
+# -----------------------------------------------------------------------------
+# Exports — the app (SAM) stack imports these. Export names are prefixed with
+# this stack's name, so set the app's BaseStackName parameter to match it.
+# -----------------------------------------------------------------------------
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub '${AWS::StackName}-VpcId' }
+
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+    Export: { Name: !Sub '${AWS::StackName}-PrivateSubnet1Id' }
+
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2
+    Export: { Name: !Sub '${AWS::StackName}-PrivateSubnet2Id' }
+
+  LambdaSecurityGroupId:
+    Value: !Ref LambdaSecurityGroup
+    Export: { Name: !Sub '${AWS::StackName}-LambdaSecurityGroupId' }
+
+  DbSecretArn:
+    Description: ARN of the RDS-managed credentials secret.
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+    Export: { Name: !Sub '${AWS::StackName}-DbSecretArn' }
+
+  DbEndpointAddress:
+    Value: !GetAtt Database.Endpoint.Address
+    Export: { Name: !Sub '${AWS::StackName}-DbEndpointAddress' }
+
+  DbName:
+    Value: !Ref DBName
+    Export: { Name: !Sub '${AWS::StackName}-DbName' }
