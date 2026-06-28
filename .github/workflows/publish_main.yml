@@ -49,7 +49,7 @@ jobs:
       # exact same artifact later - no rebuild.
       - name: Package & publish artifact
         run: |
-          sam package -t infra/template.yaml \
+          sam package -t .aws-sam/build/template.yaml \
             --s3-bucket "$ARTIFACT_BUCKET" \
             --s3-prefix "builds/${GITHUB_SHA}" \
             --output-template-file packaged.yaml
