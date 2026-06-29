@@ -91,3 +91,6 @@ Outputs:
   ApiUrl:
     Description: Base URL of the HTTP API (feed this to the React app later).
     Value: !Sub 'https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  ApiUrlLocalStack:
+    Description: Base URL of the HTTP API (feed this to the React app later).
+    Value: !Sub 'http://localhost:4566/_aws/execute-api/${ServerlessHttpApi}/'
