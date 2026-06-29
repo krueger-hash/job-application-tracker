@@ -8,9 +8,8 @@ name: Release to prod
 # Also keeps a manual trigger as an escape hatch / rollback path: dispatch with
 # a specific SHA to promote an older build.
 on:
-  push:
-    tags:
-      - 'v*'            # v0.1.0, v1.2.3, etc. Tighten to 'v*.*.*' for strict semver.
+  release:
+    types: [ published ]
   workflow_dispatch:
     inputs:
       sha:
