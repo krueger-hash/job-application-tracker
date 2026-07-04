@@ -169,6 +169,41 @@ Resources:
           return request;
         }
 
+  # SPA routing belongs only on the static S3 behavior. Do this as a viewer
+  # rewrite instead of a distribution-wide 403/404 custom error response, because
+  # custom error responses also apply to the /api/* behavior and hide API errors
+  # behind index.html.
+  SpaRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Condition: DeployFrontend
+    Properties:
+      Name: !Sub '${Environment}-job-tracker-spa-rewrite'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Rewrite client-side SPA routes to index.html for the S3 origin.
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+
+          if (request.method !== 'GET' && request.method !== 'HEAD') {
+            return request;
+          }
+
+          if (uri === '' || uri === '/' || uri.charAt(uri.length - 1) === '/') {
+            request.uri = '/index.html';
+            return request;
+          }
+
+          var lastSegment = uri.substring(uri.lastIndexOf('/') + 1);
+          if (lastSegment.indexOf('.') === -1) {
+            request.uri = '/index.html';
+          }
+
+          return request;
+        }
+
   Distribution:
     Type: AWS::CloudFront::Distribution
     Condition: DeployFrontend
@@ -205,6 +240,9 @@ Resources:
           CachedMethods: [GET, HEAD, OPTIONS]
           # AWS managed "CachingOptimized" policy.
           CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SpaRewriteFunction.FunctionMetadata.FunctionARN
 
         CacheBehaviors:
           # API traffic: forward to the backend, never cache, pass through all
@@ -223,19 +261,6 @@ Resources:
             FunctionAssociations:
               - EventType: viewer-request
                 FunctionARN: !GetAtt ApiRewriteFunction.FunctionMetadata.FunctionARN
-
-        # SPA routing: client-side routes (e.g. /applications/42) don't exist as
-        # S3 objects, so S3 returns 403/404. Serve index.html with a 200 instead
-        # and let the React router handle the path.
-        CustomErrorResponses:
-          - ErrorCode: 403
-            ResponseCode: 200
-            ResponsePagePath: /index.html
-            ErrorCachingMinTTL: 10
-          - ErrorCode: 404
-            ResponseCode: 200
-            ResponsePagePath: /index.html
-            ErrorCachingMinTTL: 10
 
         ViewerCertificate:
           # Default *.cloudfront.net cert. Swap for an ACM cert (us-east-1) +
