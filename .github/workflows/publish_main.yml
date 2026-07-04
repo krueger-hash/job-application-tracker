@@ -31,6 +31,11 @@ jobs:
       - uses: aws-actions/setup-sam@v2
         with:
           use-installer: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Assume staging deploy role (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -55,6 +60,19 @@ jobs:
             --output-template-file packaged.yaml
           aws s3 cp packaged.yaml "s3://$ARTIFACT_BUCKET/builds/${GITHUB_SHA}/packaged.yaml"
 
+      # ---- Build the frontend ONCE and store it immutably by SHA ----
+      # The Vite build is fully environment-agnostic (it calls /api/* on its own
+      # origin via the CloudFront proxy), so the SAME build can be promoted to
+      # prod later — exactly like the backend artifact above.
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+      - name: Publish frontend artifact
+        run: |
+          aws s3 sync frontend/dist/ "s3://$ARTIFACT_BUCKET/frontend/${GITHUB_SHA}/" --delete
+
       # ---- Deploy that artifact to staging ----
       - name: Deploy to staging
         run: |
@@ -68,6 +86,31 @@ jobs:
               Environment=staging \
               BaseStackName=job-application-tracker-base-staging \
               MainClass="$MAIN_CLASS"
+
+      # ---- Deploy the frontend artifact to staging ----
+      # Runs after the stack deploy so the bucket + distribution exist. Reads
+      # their names from the stack outputs (nothing hardcoded), then promotes the
+      # immutable frontend/<sha>/ artifact into the bucket and invalidates the CDN.
+      - name: Resolve staging frontend targets
+        id: fe
+        run: |
+          STACK=job-application-tracker-app-staging
+          BUCKET=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='FrontendBucketName'].OutputValue" --output text)
+          DIST=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDistributionId'].OutputValue" --output text)
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          echo "dist=$DIST" >> "$GITHUB_OUTPUT"
+      - name: Deploy frontend to staging
+        run: |
+          # Hashed assets cache forever; index.html stays uncached (see deploy-frontend.sh).
+          aws s3 sync "s3://$ARTIFACT_BUCKET/frontend/${GITHUB_SHA}/" \
+            "s3://${{ steps.fe.outputs.bucket }}/" --delete \
+            --cache-control "public,max-age=31536000,immutable" --exclude index.html
+          aws s3 cp "s3://$ARTIFACT_BUCKET/frontend/${GITHUB_SHA}/index.html" \
+            "s3://${{ steps.fe.outputs.bucket }}/index.html" --cache-control "no-cache"
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.fe.outputs.dist }}" --paths "/*" >/dev/null
 
       # ---- Record this SHA as the latest staged build ----
       - name: Mark staged
