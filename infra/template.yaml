@@ -211,8 +211,6 @@ Resources:
       DistributionConfig:
         Enabled: true
         Comment: !Sub '${Environment} job-application-tracker SPA + API proxy'
-        # The SPA's entry point for requests to the root path.
-        DefaultRootObject: index.html
         HttpVersion: http2and3
         IPV6Enabled: true
         PriceClass: !Ref CloudFrontPriceClass
