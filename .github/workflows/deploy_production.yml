@@ -39,7 +39,7 @@ jobs:
       - name: Resolve which SHA to promote
         id: resolve
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${{ github.event_name }}" = "release" ]; then
             # Tag push: promote the commit the tag points at.
             SHA="${GITHUB_SHA}"
             echo "Tag ${GITHUB_REF_NAME} -> commit $SHA"
@@ -51,10 +51,14 @@ jobs:
           fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Verify the artifact exists (must be built & staged first)
+      - name: Verify the artifacts exist (must be built & staged first)
         run: |
           if ! aws s3 ls "s3://$ARTIFACT_BUCKET/builds/${{ steps.resolve.outputs.sha }}/packaged.yaml" >/dev/null 2>&1; then
-            echo "::error::No published artifact for ${{ steps.resolve.outputs.sha }}. Tag a commit that's on main and already built by publish-main."
+            echo "::error::No published backend artifact for ${{ steps.resolve.outputs.sha }}. Tag a commit that's on main and already built by publish-main."
+            exit 1
+          fi
+          if ! aws s3 ls "s3://$ARTIFACT_BUCKET/frontend/${{ steps.resolve.outputs.sha }}/index.html" >/dev/null 2>&1; then
+            echo "::error::No published frontend artifact for ${{ steps.resolve.outputs.sha }}. Tag a commit that's on main and already built by publish-main."
             exit 1
           fi
 
@@ -76,3 +80,28 @@ jobs:
               Environment=production \
               BaseStackName=job-application-tracker-base-production \
               MainClass="$MAIN_CLASS"
+
+      # ---- Promote the SAME frontend artifact to prod ----
+      # No rebuild: copies the immutable frontend/<sha>/ build (in the staging
+      # account's artifact bucket, readable cross-account via ArtifactBucketPolicy)
+      # into the prod bucket, then invalidates the prod distribution. Runs after
+      # the stack deploy so the bucket + distribution exist.
+      - name: Resolve prod frontend targets
+        id: fe
+        run: |
+          STACK=job-application-tracker-app-production
+          BUCKET=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='FrontendBucketName'].OutputValue" --output text)
+          DIST=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDistributionId'].OutputValue" --output text)
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          echo "dist=$DIST" >> "$GITHUB_OUTPUT"
+      - name: Promote frontend to prod
+        run: |
+          aws s3 sync "s3://$ARTIFACT_BUCKET/frontend/${{ steps.resolve.outputs.sha }}/" \
+            "s3://${{ steps.fe.outputs.bucket }}/" --delete \
+            --cache-control "public,max-age=31536000,immutable" --exclude index.html
+          aws s3 cp "s3://$ARTIFACT_BUCKET/frontend/${{ steps.resolve.outputs.sha }}/index.html" \
+            "s3://${{ steps.fe.outputs.bucket }}/index.html" --cache-control "no-cache"
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.fe.outputs.dist }}" --paths "/*" >/dev/null
